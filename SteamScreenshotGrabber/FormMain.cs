@@ -49,7 +49,7 @@ namespace SteamScreenshotGrabber
 
                     // Read latest settings
                     this.startPage = Convert.ToInt32(this.textBoxPageStart.Text);
-                    this.endPage = Convert.ToInt32(this.textBoxPageStart.Text);
+                    this.endPage = Convert.ToInt32(this.textBoxPageStop.Text);
                     this.numOfThreads = Convert.ToInt32(this.comboBox1.Text);
 
                     // Start up the worker thread
@@ -113,7 +113,20 @@ namespace SteamScreenshotGrabber
                 for (int j = 0; j < imageUrls.Count; j++)
                 {
                     this.bgWorker.ReportProgress(0, "Determining URL and filename for image " + (j + 1));
-                    GenerateImageUrlAndFilename(imageUrls[j]);
+
+                    bool generated = false;
+                    do
+                    {
+                        try
+                        {
+                            GenerateImageUrlAndFilename(imageUrls[j]);
+                            generated = true;
+                        }
+                        catch
+                        {
+                            this.bgWorker.ReportProgress(0, "Error generating URL and filenamee for image " + (j + 1) + ", trying again...");
+                        }
+                    } while (!generated);
                 }
 
                 // Spawn download threads
@@ -162,10 +175,22 @@ namespace SteamScreenshotGrabber
                     imgFilename = this.imgFilenamesQueue.Dequeue();
                 }
 
-                // Download the image to the specified filename
-                Wget(imgUrl, imgFilename);
-                this.bgWorker.ReportProgress(0, "Downloaded " + imgFilename + ".");
+                // Download the image to the specified filename, special logic to keep trying until downloaded
+                bool imageDownloaded = false;
+                do
+                {
+                    try
+                    {
+                        Wget(imgUrl, imgFilename);
+                        imageDownloaded = true;
+                    }
+                    catch
+                    {
+                        this.bgWorker.ReportProgress(0, "Error downloading screenshot " + imgFilename + ", trying again...");
+                    }
+                } while (!imageDownloaded);
 
+                this.bgWorker.ReportProgress(0, "Downloaded " + imgFilename + ".");
 
                 // A tiny sleep just in case there's some horrible error so we don't eat CPU
                 Thread.Sleep(10);
