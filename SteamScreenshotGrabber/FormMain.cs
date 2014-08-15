@@ -9,6 +9,7 @@ using System.Windows.Forms;
 using System.Net;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace SteamScreenshotGrabber
 {
@@ -18,7 +19,11 @@ namespace SteamScreenshotGrabber
         BackgroundWorker bgWorker = null; // The background thread that does the downloading
         int startPage = 0; // The first page to download
         int endPage = 0; // The last page to download
-        string albumPageUrl = ""; // THe URL of the current album page
+        string albumPageUrl = ""; // The URL of the current album page
+        int numOfThreads = 2; // The number of download threads to use
+        Queue<string> imgUrlsQueue = new Queue<string>(); // Queue of image URLs to download
+        Queue<string> imgFilenamesQueue = new Queue<string>(); // Queue of image filenames to save the URLs to
+        int workerThreadsRunning = 0;
 
         /// <summary>
         /// Boring constructor is boring...
@@ -39,10 +44,13 @@ namespace SteamScreenshotGrabber
             {
                 if (this.bgWorker == null)
                 {
+                    // Update the GUI
                     this.buttonStart.Text = "Stop";
 
+                    // Read latest settings
                     this.startPage = Convert.ToInt32(this.textBoxPageStart.Text);
                     this.endPage = Convert.ToInt32(this.textBoxPageStart.Text);
+                    this.numOfThreads = Convert.ToInt32(this.comboBox1.Text);
 
                     // Start up the worker thread
                     this.bgWorker = new BackgroundWorker();
@@ -98,13 +106,26 @@ namespace SteamScreenshotGrabber
                 List<string> imageUrls = ParseImageUrls(html);
                 this.bgWorker.ReportProgress(0, "Found " + imageUrls.Count + " screenshots on this page.");
 
-                // Download each image
+                // Generate URL and destination filename for each image
                 this.bgWorker.ReportProgress(0, "Downloading screenshots...");
+                this.imgUrlsQueue.Clear();
+                this.imgFilenamesQueue.Clear();
                 for (int j = 0; j < imageUrls.Count; j++)
                 {
-                    this.bgWorker.ReportProgress(0, "Downloading screenshot " + (j + 1) + "/" + imageUrls.Count + " from page " + i + "...");
-                    string imgFile = DownloadImage(imageUrls[j]);
-                    this.bgWorker.ReportProgress(0, "Screenshot saved to: " + imgFile);
+                    this.bgWorker.ReportProgress(0, "Determining URL and filename for image " + (j + 1));
+                    GenerateImageUrlAndFilename(imageUrls[j]);
+                }
+
+                // Spawn download threads
+                for (int n = 0; n < this.numOfThreads; n++)
+                {
+                    new Thread(new ThreadStart(ImageDownloadThread)).Start();
+                }
+
+                // Now wait for screenshot download threads to finish working...
+                while (this.workerThreadsRunning > 0)
+                {
+                    Thread.Sleep(50);
 
                     if (this.bgWorker.CancellationPending)
                     {
@@ -115,6 +136,45 @@ namespace SteamScreenshotGrabber
             }
 
             this.bgWorker.ReportProgress(0, "Finished downloading all screenshots.");
+        }
+
+        void ImageDownloadThread()
+        {
+            lock (this)
+            {
+                this.workerThreadsRunning++;
+            }
+
+            while (true)
+            {
+                // Quit early if necessary
+                if (this.bgWorker.CancellationPending) break;
+
+                string imgUrl = "";
+                string imgFilename = "";
+
+                // Grab an image URL and filename
+                lock (this.imgUrlsQueue)
+                {
+                    if (this.imgUrlsQueue.Count == 0) break;
+                    this.bgWorker.ReportProgress(0, "Downloading image " + this.imgUrlsQueue.Count + "...");
+                    imgUrl = this.imgUrlsQueue.Dequeue();
+                    imgFilename = this.imgFilenamesQueue.Dequeue();
+                }
+
+                // Download the image to the specified filename
+                Wget(imgUrl, imgFilename);
+                this.bgWorker.ReportProgress(0, "Downloaded " + imgFilename + ".");
+
+
+                // A tiny sleep just in case there's some horrible error so we don't eat CPU
+                Thread.Sleep(10);
+            }
+
+            lock (this)
+            {
+                this.workerThreadsRunning--;
+            }
         }
 
         /// <summary>
@@ -135,9 +195,11 @@ namespace SteamScreenshotGrabber
         /// <param name="e"></param>
         void bgWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
         {
+            this.bgWorker = null;
+
+            // Update the GUI
             this.richTextBox.AppendText(DateTime.Now.ToString("[HH:mm:ss] ") + "Done\r\n");
             this.richTextBox.ScrollToCaret();
-            this.bgWorker = null;
             this.buttonStart.Text = "Start";
         }
 
@@ -146,7 +208,7 @@ namespace SteamScreenshotGrabber
         /// </summary>
         /// <param name="imagePageURL"></param>
         /// <returns></returns>
-        private string DownloadImage(string imagePageURL)
+        private void GenerateImageUrlAndFilename(string imagePageURL)
         {
             Wget(imagePageURL, "imagepage.html");
             string[] lines = File.ReadAllLines("imagepage.html");
@@ -177,20 +239,20 @@ namespace SteamScreenshotGrabber
                     date = date.Replace(" @ ", " "); // "Feb 26, 2011 2:40pm"
                     DateTime dt = DateTime.Parse(date);
 
-                    // Generate a filename (this is needed because there can be multiple screenshots taken the same minute)
+                    // Generate a filename (while loop is needed because there can be multiple screenshots taken the same minute)
                     int number = 0;
                     do
                     {
                         imageDestinationFilename = dt.ToString("yyyy-MM-dd HH-mm-") + number.ToString("D2") + ".jpg";
                         number++;
                     }
-                    while (File.Exists(imageDestinationFilename));
+                    while (this.imgFilenamesQueue.Contains(imageDestinationFilename));
                 }
             }
 
-            // Download the screenshot
-            Wget(imageUrl, imageDestinationFilename);
-            return imageDestinationFilename;
+            // Save the URL and the destination filename
+            this.imgUrlsQueue.Enqueue(imageUrl);
+            this.imgFilenamesQueue.Enqueue(imageDestinationFilename);
         }
 
         /// <summary>
@@ -273,6 +335,7 @@ namespace SteamScreenshotGrabber
         private void FormMain_Load(object sender, EventArgs e)
         {
             FormMain_Resize(null, null);
+            this.comboBox1.SelectedIndex = 1;
         }
 
         /// <summary>
