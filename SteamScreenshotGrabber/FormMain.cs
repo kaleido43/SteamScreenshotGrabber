@@ -10,20 +10,18 @@ using System.Net;
 using System.IO;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Reflection;
 
 namespace SteamScreenshotGrabber
 {
     public partial class FormMain : Form
     {
-
+        MultithreadedDownloader mtd = new MultithreadedDownloader();
         BackgroundWorker bgWorker = null; // The background thread that does the downloading
         int startPage = 0; // The first page to download
         int endPage = 0; // The last page to download
         string albumPageUrl = ""; // The URL of the current album page
         int numOfThreads = 2; // The number of download threads to use
-        Queue<string> imgUrlsQueue = new Queue<string>(); // Queue of image URLs to download
-        Queue<string> imgFilenamesQueue = new Queue<string>(); // Queue of image filenames to save the URLs to
-        int workerThreadsRunning = 0;
 
         /// <summary>
         /// Boring constructor is boring...
@@ -31,6 +29,7 @@ namespace SteamScreenshotGrabber
         public FormMain()
         {
             InitializeComponent();
+            Log.Instance.LogEvent += new StringDelegate(LogMsg);
         }
 
         /// <summary>
@@ -57,19 +56,33 @@ namespace SteamScreenshotGrabber
                     this.bgWorker.WorkerReportsProgress = true;
                     this.bgWorker.WorkerSupportsCancellation = true;
                     this.bgWorker.RunWorkerCompleted += new RunWorkerCompletedEventHandler(bgWorker_RunWorkerCompleted);
-                    this.bgWorker.ProgressChanged += new ProgressChangedEventHandler(bgWorker_ProgressChanged);
                     this.bgWorker.DoWork += new DoWorkEventHandler(bgWorker_DoWork);
                     this.bgWorker.RunWorkerAsync();
                 }
                 else
                 {
                     // Stop the worker thread
+                    this.mtd.CancelAsync();
                     this.bgWorker.CancelAsync();
                 }
             }
             catch (Exception ex)
             {
                 MessageBox.Show(ex.ToString());
+            }
+        }
+
+        private delegate void SetControlPropertyThreadSafeDelegate(string msg);
+        public void LogMsg(string msg)
+        {
+            if (this.richTextBox.InvokeRequired)
+            {
+                this.richTextBox.Invoke(new SetControlPropertyThreadSafeDelegate(LogMsg), new object[] { msg });
+            }
+            else
+            {
+                this.richTextBox.AppendText(DateTime.Now.ToString("[HH:mm:ss] ") + msg + "\r\n");
+                this.richTextBox.ScrollToCaret();
             }
         }
 
@@ -85,132 +98,88 @@ namespace SteamScreenshotGrabber
 
             for (int i = startPage; i <= endPage; i++)
             {
-                if (this.bgWorker.CancellationPending)
-                {
-                    this.bgWorker.ReportProgress(0, "Cancelling...");
-                    return;
-                }
+                if (this.bgWorker.CancellationPending) return;
 
                 // Generate the URL to the current album page
-                this.bgWorker.ReportProgress(0, "Generating album page URL...");
+                Log.Instance.LogMsg("Generating album page URL...");
                 GenerateURL(i);
-                this.bgWorker.ReportProgress(0, "Generated: " + albumPageUrl);
+                Log.Instance.LogMsg("Generated: " + albumPageUrl);
 
                 // Download the current album page
-                this.bgWorker.ReportProgress(0, "Downloading album page " + i + "...");
-                Wget(this.albumPageUrl, "albumpage.html");
-                string[] html = File.ReadAllLines("albumpage.html");
+                Log.Instance.LogMsg("Downloading album page " + i + "...");
+                string[] html = Utils.GetPageHtml(this.albumPageUrl);
 
                 // Parse all screenshot page URLs from the album page
-                this.bgWorker.ReportProgress(0, "Seraching for screenshot URLs on page " + i + "...");
+                Log.Instance.LogMsg("Searching for screenshot URLs on page " + i + "...");
                 List<string> imageUrls = ParseImageUrls(html);
-                this.bgWorker.ReportProgress(0, "Found " + imageUrls.Count + " screenshots on this page.");
+                Log.Instance.LogMsg("Found " + imageUrls.Count + " screenshots on this page.");
 
-                // Generate URL and destination filename for each image
-                this.bgWorker.ReportProgress(0, "Downloading screenshots...");
-                this.imgUrlsQueue.Clear();
-                this.imgFilenamesQueue.Clear();
-                for (int j = 0; j < imageUrls.Count; j++)
+                // Download the HTML for each screenshot page
+                Log.Instance.LogMsg("Attempting to download the page for each screenshot on this album page...");
+                if (this.bgWorker.CancellationPending) return;
+                List<string[]> pageHtmls = mtd.Download(imageUrls, this.numOfThreads);
+
+                // Determine URLs and filenames for each screenshot
+                List<string> screenshotUrls = new List<string>();
+                List<string> screenshotFilenames = new List<string>();
+                foreach (string[] lines in pageHtmls)
                 {
-                    this.bgWorker.ReportProgress(0, "Determining URL and filename for image " + (j + 1));
-
-                    bool generated = false;
-                    do
+                    foreach (string line in lines)
                     {
-                        try
+                        // Find the direct URL to the image itself
+                        if (line.Contains("ActualMedia"))
                         {
-                            GenerateImageUrlAndFilename(imageUrls[j]);
-                            generated = true;
+                            // Grab the direct URL of the image
+                            // Sample line of what I'm expecting:
+                            // \t\t\t\t<a href=\"http://cloud-4.steampowered.com/ugc/595804413485986490/B75F91916AB097CA12337C01BB3B2A7A678A7F45/\" target=\"_blank\"><img id=\"ActualMedia\" class=\"screenshotEnlargeable\" src=\"http://cloud-4.steampowered.com/ugc/595804413485986490/B75F91916AB097CA12337C01BB3B2A7A678A7F45/1024x640.resizedimage\" width=\"1024\"></a>
+                            screenshotUrls.Add(Regex.Match(line, "http[^\"]+").Captures[0].Value);
                         }
-                        catch
+
+                        // Find the timestamp of the image
+                        if (line.Contains("detailsStatRight") && line.Contains(" @ "))
                         {
-                            this.bgWorker.ReportProgress(0, "Error generating URL and filenamee for image " + (j + 1) + ", trying again...");
+                            // Sample line of what I'm expecting:
+                            // \t\t\t\t\t\t\t\t<div class=\"detailsStatRight\">Feb 26, 2011 @ 2:40pm</div>
+                            // \t\t\t\t\t\t\t\t<div class=\"detailsStatRight\">Feb 26 @ 2:40pm</div>
+                            // Note there are two different formats.  The one missing the year is THIS year.
+
+                            // Get the date of the screenshot
+                            string date = Regex.Match(line, "[>]([^<]+)").Captures[0].Value; // ">Feb 26, 2011 @ 2:40pm"
+                            date = date.TrimStart('>'); // "Feb 26, 2011 @ 2:40pm" or "Feb 26 @ 2:40pm"
+                            if (date.Contains(","))
+                            {
+                                // "Feb 26, 2011 @ 2:40pm"
+                                date = date.Replace(" @ ", " "); // "Feb 26, 2011 2:40pm"
+                            }
+                            else
+                            {
+                                // "Feb 26 @ 2:40pm"
+                                date = date.Replace(" @ ", ", " + DateTime.Now.Year + " "); // "Feb 26, 2011 2:40pm"
+                            }
+
+                            DateTime dt = DateTime.Parse(date);
+
+                            // Generate a filename (while loop is needed because there can be multiple screenshots taken the same minute)
+                            int number = 0;
+                            string imageDestinationFilename = "";
+                            do
+                            {
+                                imageDestinationFilename = dt.ToString("yyyy-MM-dd HH-mm-") + number.ToString("D2") + ".jpg";
+                                number++;
+                            }
+                            while (screenshotFilenames.Contains(imageDestinationFilename) || File.Exists(imageDestinationFilename));
+                            screenshotFilenames.Add(imageDestinationFilename);
                         }
-                    } while (!generated);
-                }
-
-                // Spawn download threads
-                for (int n = 0; n < this.numOfThreads; n++)
-                {
-                    new Thread(new ThreadStart(ImageDownloadThread)).Start();
-                }
-
-                // Now wait for screenshot download threads to finish working...
-                while (this.workerThreadsRunning > 0)
-                {
-                    Thread.Sleep(50);
-
-                    if (this.bgWorker.CancellationPending)
-                    {
-                        this.bgWorker.ReportProgress(0, "Cancelling...");
-                        return;
                     }
                 }
+
+                if (this.bgWorker.CancellationPending) return;
+
+                // Now download each screenshot
+                mtd.Download(screenshotUrls, screenshotFilenames, this.numOfThreads);
             }
 
             this.bgWorker.ReportProgress(0, "Finished downloading all screenshots.");
-        }
-
-        void ImageDownloadThread()
-        {
-            lock (this)
-            {
-                this.workerThreadsRunning++;
-            }
-
-            while (true)
-            {
-                // Quit early if necessary
-                if (this.bgWorker.CancellationPending) break;
-
-                string imgUrl = "";
-                string imgFilename = "";
-
-                // Grab an image URL and filename
-                lock (this.imgUrlsQueue)
-                {
-                    if (this.imgUrlsQueue.Count == 0) break;
-                    this.bgWorker.ReportProgress(0, "Downloading image " + this.imgUrlsQueue.Count + "...");
-                    imgUrl = this.imgUrlsQueue.Dequeue();
-                    imgFilename = this.imgFilenamesQueue.Dequeue();
-                }
-
-                // Download the image to the specified filename, special logic to keep trying until downloaded
-                bool imageDownloaded = false;
-                do
-                {
-                    try
-                    {
-                        Wget(imgUrl, imgFilename);
-                        imageDownloaded = true;
-                    }
-                    catch
-                    {
-                        this.bgWorker.ReportProgress(0, "Error downloading screenshot " + imgFilename + ", trying again...");
-                    }
-                } while (!imageDownloaded);
-
-                this.bgWorker.ReportProgress(0, "Downloaded " + imgFilename + ".");
-
-                // A tiny sleep just in case there's some horrible error so we don't eat CPU
-                Thread.Sleep(10);
-            }
-
-            lock (this)
-            {
-                this.workerThreadsRunning--;
-            }
-        }
-
-        /// <summary>
-        /// Used by the download thread to update the GUI
-        /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
-        void bgWorker_ProgressChanged(object sender, ProgressChangedEventArgs e)
-        {
-            this.richTextBox.AppendText(DateTime.Now.ToString("[HH:mm:ss] ") + (string)e.UserState + "\r\n");
-            this.richTextBox.ScrollToCaret();
         }
 
         /// <summary>
@@ -226,58 +195,6 @@ namespace SteamScreenshotGrabber
             this.richTextBox.AppendText(DateTime.Now.ToString("[HH:mm:ss] ") + "Done\r\n");
             this.richTextBox.ScrollToCaret();
             this.buttonStart.Text = "Start";
-        }
-
-        /// <summary>
-        /// Given a URL to the page that contains a screenshot, downloads the image and names it appropriately
-        /// </summary>
-        /// <param name="imagePageURL"></param>
-        /// <returns></returns>
-        private void GenerateImageUrlAndFilename(string imagePageURL)
-        {
-            Wget(imagePageURL, "imagepage.html");
-            string[] lines = File.ReadAllLines("imagepage.html");
-
-            string imageUrl = "";
-            string imageDestinationFilename = "";
-
-            foreach (string line in lines)
-            {
-                // Find the direct URL to the image itself
-                if (line.Contains("ActualMedia"))
-                {
-                    // Grab the direct URL of the image
-                    // Sample line of what I'm expecting:
-                    // \t\t\t\t<a href=\"http://cloud-4.steampowered.com/ugc/595804413485986490/B75F91916AB097CA12337C01BB3B2A7A678A7F45/\" target=\"_blank\"><img id=\"ActualMedia\" class=\"screenshotEnlargeable\" src=\"http://cloud-4.steampowered.com/ugc/595804413485986490/B75F91916AB097CA12337C01BB3B2A7A678A7F45/1024x640.resizedimage\" width=\"1024\"></a>
-                    imageUrl = Regex.Match(line, "http[^\"]+").Captures[0].Value;
-                }
-
-                // Find the timestamp of the image
-                if (line.Contains("detailsStatRight") && line.Contains(" @ "))
-                {
-                    // Sample line of what I'm expecting:
-                    // \t\t\t\t\t\t\t\t<div class=\"detailsStatRight\">Feb 26, 2011 @ 2:40pm</div>
-
-                    // Get the date of the screenshot
-                    string date = Regex.Match(line, "[>]([^<]+)").Captures[0].Value; // ">Feb 26, 2011 @ 2:40pm"
-                    date = date.TrimStart('>'); // "Feb 26, 2011 @ 2:40pm"
-                    date = date.Replace(" @ ", " "); // "Feb 26, 2011 2:40pm"
-                    DateTime dt = DateTime.Parse(date);
-
-                    // Generate a filename (while loop is needed because there can be multiple screenshots taken the same minute)
-                    int number = 0;
-                    do
-                    {
-                        imageDestinationFilename = dt.ToString("yyyy-MM-dd HH-mm-") + number.ToString("D2") + ".jpg";
-                        number++;
-                    }
-                    while (this.imgFilenamesQueue.Contains(imageDestinationFilename));
-                }
-            }
-
-            // Save the URL and the destination filename
-            this.imgUrlsQueue.Enqueue(imageUrl);
-            this.imgFilenamesQueue.Enqueue(imageDestinationFilename);
         }
 
         /// <summary>
@@ -324,20 +241,6 @@ namespace SteamScreenshotGrabber
                 "&sort=" +
                 order +
                 "first&view=grid";
-        }
-
-        // Thanks to:  http://stackoverflow.com/questions/26233/fastest-c-sharp-code-to-download-a-web-page
-        public string Wget(string url)
-        {
-            WebClient client = new WebClient();
-            client.DownloadFile(url, "imagepage.html");
-            return client.DownloadString(url);
-        }
-        public void Wget(string url, string localFilename)
-        {
-            WebClient client = new WebClient();
-            if (File.Exists(localFilename)) File.Delete(localFilename);
-            client.DownloadFile(url, localFilename);
         }
 
         /// <summary>
